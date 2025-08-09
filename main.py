@@ -11,6 +11,7 @@ try:
 except Exception:
     HAS_ORT = False
 
+
 # ---------------- ONNX Detector (robust) ----------------
 class ONNXFaceDetector:
     def __init__(self, onnx_path,
@@ -112,7 +113,7 @@ class ONNXFaceDetector:
             area_r = (boxes[rest, 2] - boxes[rest, 0]) * (boxes[rest, 3] - boxes[rest, 1])
             iou = inter / (area_i + area_r - inter + 1e-6)
             idxs = rest[iou < iou_thres]
-            return keep
+        return keep
 
     def _preprocess(self, img_bgr_or_gray):
         # 입력: 그레이 또는 BGR, 출력: (1,3,H,W) float32 [0..1], scale_to=(W,H)
@@ -130,6 +131,8 @@ class ONNXFaceDetector:
     def _parse_outputs(self, ort_out, scale_from, scale_to):
         """
         ort_out[0]가 [N,5] 또는 [1,N,5] (x1,y1,x2,y2,conf) 형식이라고 가정
+        scale_from: 네트 입력 사이즈 (W_in, H_in)
+        scale_to:   표시할 이미지 사이즈 (W, H)
         """
         preds = ort_out[0]
         if preds.ndim == 3:  # (1,N,5)
@@ -158,34 +161,55 @@ class ONNXFaceDetector:
         keep = self._nms(boxes, scores, self.iou_thres)
         return boxes[keep].astype(np.int32), scores[keep]
 
-    def detect(self, rgb_img):
-        # normalize size
-        h, w = rgb_img.shape[:2]
-        scale = 800.0 / max(h, w)
-        if scale < 1.0:
-            rgb = cv2.resize(rgb_img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-        else:
-            rgb = rgb_img.copy()
+def detect(self, rgb_img):
+    # normalize size
+    h, w = rgb_img.shape[:2]
+    scale = 800.0 / max(h, w)
+    if scale < 1.0:
+        rgb = cv2.resize(rgb_img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    else:
+        rgb = rgb_img.copy()
 
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        clahe_gray = self._clahe_proc(gray)
-        proc_gray = cv2.bitwise_not(clahe_gray) if self.use_invert else clahe_gray
-        display_img = cv2.cvtColor(proc_gray, cv2.COLOR_GRAY2RGB)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
-        blob, in_size = self._preprocess(proc_gray)
-        out = self.sess.run(None, {self.inp_name: blob})
+    # preprocessed variants
+    g_plain = gray
+    g_clahe = self._clahe(gray)             # CLAHE 강도는 self.clipLimit 슬라이더로 반영됨
+    g_inv = cv2.bitwise_not(gray)
+    g_clahe_inv = cv2.bitwise_not(g_clahe)
 
-        boxes, scores = self._parse_outputs(out, self.input_size, in_size)
-        faces = []
-        for (x1, y1, x2, y2) in boxes:
-            cv2.rectangle(display_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            faces.append((x1, y1, x2 - x1, y2 - y1))
-        return display_img, faces
+    # 탐지 시도 시나리오(여러 후보 중 먼저 잡히는 걸로 박스만 얻음)
+    scenarios = (
+        [("haar", g_inv), ("haar", g_clahe_inv), ("lbp", g_inv), ("lbp", g_clahe_inv)]
+        if self.use_invert
+        else [("haar", g_plain), ("haar", g_clahe), ("lbp", g_plain), ("lbp", g_clahe)]
+    )
+
+    # === 표시 정책: "항상" 현재 설정 기반 전처리 배경을 먼저 깐다 ===
+    # invert 토글 기준으로 어떤 전처리 이미지를 보여줄지 결정
+    display_gray = g_clahe_inv if self.use_invert else g_clahe
+    # show_processed가 True면 전처리 이미지를 컬러로 변환해 배경으로, 아니면 원본 컬러
+    result = cv2.cvtColor(display_gray, cv2.COLOR_GRAY2RGB) if self.show_processed else rgb.copy()
+
+    # === 탐지: 박스만 현재 result 위에 그린다 (result를 덮어쓰지 말 것!) ===
+    best_faces = []
+    for kind, g in scenarios:
+        classifier = self.haar if kind == "haar" else self.lbp
+        faces = self._detect_once(g, classifier)
+        if len(faces) > 0:
+            best_faces = faces
+            break
+
+    # draw boxes (있으면)
+    for (x, y, wf, hf) in best_faces:
+        cv2.rectangle(result, (x, y), (x + wf, y + hf), (0, 255, 0), 2)
+
+    return result, best_faces
 
 
 # ---------------- Haar/LBP Detector ----------------
 class HaarFaceDetector:
-    def __init__(self):
+    def __init__(self, show_processed=True):
         self.haar = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
         self.lbp = cv2.CascadeClassifier(cv2.data.haarcascades + "lbpcascade_frontalface.xml")
         self.scaleFactor = 1.15
@@ -193,6 +217,7 @@ class HaarFaceDetector:
         self.minSize = 40
         self.clipLimit = 2.0
         self.use_invert = False
+        self.show_processed = show_processed  # 전처리 영상 표시 여부
 
     def set_params(self, sf, mn, ms, clip, inv):
         self.scaleFactor = float(sf)
@@ -237,11 +262,14 @@ class HaarFaceDetector:
         else:
             scenarios = [("haar", g_plain), ("haar", g_clahe), ("lbp", g_plain), ("lbp", g_clahe)]
 
+        # 기본은 원본 컬러, show_processed면 탐지에 사용한 그레이 영상을 컬러로 변환해 표시
         result = rgb.copy()
         for kind, g in scenarios:
             classifier = self.haar if kind == "haar" else self.lbp
             faces = self._detect_once(g, classifier)
             if len(faces) > 0:
+                if self.show_processed:
+                    result = cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)
                 for (x, y, wf, hf) in faces:
                     cv2.rectangle(result, (x, y), (x + wf, y + hf), (0, 255, 0), 2)
                 return result, faces
@@ -258,7 +286,7 @@ class FaceDetectApp:
         self.backend = tk.StringVar(value="Haar")  # "Haar" or "ONNX"
         self.onnx_model_path = None
         self.onnx_detector = None
-        self.haar_detector = HaarFaceDetector()
+        self.haar_detector = HaarFaceDetector(show_processed=True)
 
         # Top: backend selector
         top = tk.Frame(root); top.pack(pady=6)
@@ -276,6 +304,12 @@ class FaceDetectApp:
         self.provider_menu = tk.OptionMenu(top, self.provider_var, "CPUExecutionProvider", "CUDAExecutionProvider")
         self.provider_menu.config(state=tk.DISABLED)
         self.provider_menu.pack(side=tk.LEFT, padx=5)
+
+        # Show processed checkbox (Haar)
+        self.show_proc_var = tk.IntVar(value=1)
+        self.chk_show_proc = tk.Checkbutton(top, text="Show processed view (Haar)", variable=self.show_proc_var,
+                                            command=self._toggle_show_processed)
+        self.chk_show_proc.pack(side=tk.LEFT, padx=8)
 
         # Image panels
         self.image_frame = tk.Frame(root)
@@ -309,6 +343,10 @@ class FaceDetectApp:
 
         # 초기 백엔드 상태 반영
         self._on_backend_change("Haar")
+
+    def _toggle_show_processed(self):
+        self.haar_detector.show_processed = bool(self.show_proc_var.get())
+        self.run_detection()
 
     # ---------- UI builders ----------
     def _build_haar_panel(self, parent):
@@ -358,6 +396,11 @@ class FaceDetectApp:
             # show Haar / hide ONNX
             self.haar_panel.pack(side=tk.LEFT, padx=6, fill=tk.BOTH, expand=True)
             self.onnx_panel.pack_forget()
+            # autorun for haar knobs
+            self._hook_autorun(self.haar_sliders + self.common_sliders)
+
+        # 즉시 한 번 갱신
+        self.run_detection()
 
     def _choose_onnx(self):
         if not HAS_ORT:
@@ -389,17 +432,24 @@ class FaceDetectApp:
         path = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp")])
         if not path:
             return
-        img = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB)
+        img_bgr = cv2.imread(path)
+        if img_bgr is None:
+            messagebox.showerror("Load Error", "이미지를 읽을 수 없습니다.")
+            return
+        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         self.original_image = img
         self._show(self.left, img)
+        self.run_detection()
 
     def save_image(self):
         if self.result_image is None:
+            messagebox.showwarning("Save", "저장할 결과 이미지가 없습니다.")
             return
         path = filedialog.asksaveasfilename(defaultextension=".png")
         if not path:
             return
         cv2.imwrite(path, cv2.cvtColor(self.result_image, cv2.COLOR_RGB2BGR))
+        messagebox.showinfo("Save", f"저장 완료: {path}")
 
     # ---------- Inference ----------
     def run_detection(self):
